@@ -5,6 +5,11 @@ const jwt = require("jsonwebtoken");
 const cookieParser = require("cookie-parser");
 const axios = require("axios");
 const crypto = require("crypto");
+const nodemailer = require("nodemailer"); // For email verification and password reset
+const rateLimit = require("express-rate-limit"); // For rate limiting
+const speakeasy = require("speakeasy"); // For MFA
+const qrcode = require("qrcode"); // For MFA QR codes
+const zxcvbn = require("zxcvbn"); // For password strength checking
 require("dotenv").config();
 
 const { connectToDB } = require("./db/db.connect.js");
@@ -25,6 +30,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(cookieParser());
 
+// Verify required environment variables
 if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET) {
   console.error(
     "CRITICAL ERROR: JWT secrets not set in environment variables!"
@@ -32,11 +38,184 @@ if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET) {
   process.exit(1);
 }
 
+// Check for email-related environment variables
+if (
+  !process.env.EMAIL_HOST ||
+  !process.env.EMAIL_PORT ||
+  !process.env.EMAIL_USER ||
+  !process.env.EMAIL_PASSWORD ||
+  !process.env.EMAIL_FROM
+) {
+  console.warn(
+    "WARNING: Email configuration not complete. Email features will not work."
+  );
+}
+
 const JWT_SECRET = process.env.JWT_SECRET;
 const REFRESH_TOKEN_SECRET = process.env.REFRESH_TOKEN_SECRET;
 
 connectToDB();
 
+// Email transporter setup for sending verification and password reset emails
+// At the top of your index.js file, replace your current transporter setup with:
+// let transporter;
+
+// // Create a testing account with Ethereal first time the server starts
+// nodemailer.createTestAccount().then((testAccount) => {
+//   console.log("Ethereal Email credentials created:");
+//   console.log("Email: " + testAccount.user); // Save this
+//   console.log("Password: " + testAccount.pass); // Save this
+
+//   // Create a transporter object using the test account
+//   transporter = nodemailer.createTransport({
+//     host: "smtp.ethereal.email",
+//     port: 587,
+//     secure: false, // true for 465, false for other ports
+//     auth: {
+//       user: testAccount.user,
+//       pass: testAccount.pass,
+//     },
+//   });
+// });
+
+// Replace your Ethereal setup with this
+const transporter = nodemailer.createTransport({
+  host: process.env.EMAIL_HOST,
+  port: process.env.EMAIL_PORT,
+  secure: false,
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASSWORD,
+  },
+});
+
+// Email sending utilities
+const sendVerificationEmail = async (user, verificationUrl) => {
+  try {
+    await transporter.sendMail({
+      from: `"${process.env.APP_NAME || "Auth System"}" <${
+        process.env.EMAIL_FROM
+      }>`,
+      to: user.email,
+      subject: "Verify Your Email Address",
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2>Verify Your Email Address</h2>
+          <p>Hi ${user.name},</p>
+          <p>Thanks for registering! Please verify your email address by clicking the button below:</p>
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${verificationUrl}" style="background-color: #4CAF50; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; font-weight: bold;">Verify Email</a>
+          </div>
+          <p>This link will expire in 24 hours.</p>
+          <p>If you didn't create an account, you can safely ignore this email.</p>
+        </div>
+      `,
+    });
+  } catch (error) {
+    console.error("Error sending verification email:", error);
+    throw new Error("Failed to send verification email");
+  }
+};
+
+const sendPasswordResetEmail = async (user, resetUrl) => {
+  try {
+    await transporter.sendMail({
+      from: `"${process.env.APP_NAME || "Auth System"}" <${
+        process.env.EMAIL_FROM
+      }>`,
+      to: user.email,
+      subject: "Password Reset Request",
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2>Password Reset Request</h2>
+          <p>Hi ${user.name},</p>
+          <p>We received a request to reset your password. Click the button below to reset it:</p>
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${resetUrl}" style="background-color: #4285F4; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; font-weight: bold;">Reset Password</a>
+          </div>
+          <p>This link will expire in 1 hour.</p>
+          <p>If you didn't request a password reset, you can safely ignore this email.</p>
+        </div>
+      `,
+    });
+  } catch (error) {
+    console.error("Error sending password reset email:", error);
+    throw new Error("Failed to send password reset email");
+  }
+};
+
+// Password validation function
+const validatePassword = (password, userInfo = {}) => {
+  // Basic length check
+  if (password.length < 8) {
+    return {
+      valid: false,
+      message: "Password must be at least 8 characters long",
+      score: 0,
+    };
+  }
+
+  // Use zxcvbn for advanced strength checking
+  const result = zxcvbn(password, [
+    userInfo.email || "",
+    userInfo.username || "",
+    userInfo.name || "",
+  ]);
+
+  // Score interpretation: 0-4, where 0 is very weak and 4 is very strong
+  if (result.score < 2) {
+    return {
+      valid: false,
+      message: result.feedback.warning || "Password is too weak",
+      suggestions: result.feedback.suggestions,
+      score: result.score,
+    };
+  }
+
+  return {
+    valid: true,
+    score: result.score,
+  };
+};
+
+// Rate limiters
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 attempts per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    message:
+      "Too many login attempts from this IP, please try again after 15 minutes",
+  },
+});
+
+const passwordResetLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 3, // 3 attempts per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    message: "Too many password reset attempts, please try again after an hour",
+  },
+});
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30, // 30 requests per minute
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    message: "Too many requests, please try again later",
+  },
+});
+
+// Apply rate limiting to sensitive routes
+app.use("/auth/login", loginLimiter);
+app.use("/auth/forgot-password", passwordResetLimiter);
+app.use("/api", apiLimiter);
+
+// Token generation and management
 const generateTokens = (user) => {
   const payload = {
     id: user._id,
@@ -86,6 +265,7 @@ const clearAuthCookies = (res) => {
   });
 };
 
+// Authentication middleware
 const authenticateToken = (req, res, next) => {
   const accessToken = req.cookies.access_token;
 
@@ -109,10 +289,32 @@ const authenticateToken = (req, res, next) => {
   }
 };
 
-const loginLimiter = (req, res, next) => {
-  next();
+// Check if email is verified middleware
+const requireVerifiedEmail = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.user.id);
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (!user.emailVerified) {
+      return res.status(403).json({
+        message: "Please verify your email address to access this feature",
+        code: "EMAIL_NOT_VERIFIED",
+      });
+    }
+
+    next();
+  } catch (error) {
+    console.error("Email verification check error:", error);
+    res.status(500).json({ message: "Server error" });
+  }
 };
 
+// ROUTES
+
+// Registration with email verification
 app.post("/auth/register", async (req, res) => {
   const { username, name, email, password } = req.body;
 
@@ -129,10 +331,18 @@ app.post("/auth/register", async (req, res) => {
       .json({ message: "Please provide a valid email address" });
   }
 
-  if (password.length < 8) {
-    return res
-      .status(400)
-      .json({ message: "Password must be at least 8 characters long" });
+  // Enhanced password validation
+  const passwordValidation = validatePassword(password, {
+    username,
+    email,
+    name,
+  });
+  if (!passwordValidation.valid) {
+    return res.status(400).json({
+      message: passwordValidation.message,
+      suggestions: passwordValidation.suggestions,
+      score: passwordValidation.score,
+    });
   }
 
   try {
@@ -152,14 +362,29 @@ app.post("/auth/register", async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
+    // Generate verification token
+    const emailVerificationToken = crypto.randomBytes(32).toString("hex");
+
     const newUser = new User({
       username,
       name,
       email: email || null,
       password: hashedPassword,
+      // Email verification fields
+      emailVerified: false,
+      emailVerificationToken,
+      emailVerificationExpires: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
     });
 
     await newUser.save();
+
+    // Send verification email if email is provided
+    if (email) {
+      const verificationUrl = `${process.env.FRONTEND_URL}/verify-email?token=${emailVerificationToken}`;
+      await sendVerificationEmail(newUser, verificationUrl).catch((err) =>
+        console.error("Failed to send verification email:", err)
+      );
+    }
 
     const { accessToken, refreshToken } = generateTokens(newUser);
 
@@ -170,10 +395,13 @@ app.post("/auth/register", async (req, res) => {
       username: newUser.username,
       name: newUser.name,
       email: newUser.email,
+      emailVerified: newUser.emailVerified,
     };
 
     res.status(201).json({
-      message: "User registered successfully",
+      message: email
+        ? "User registered successfully. Please check your email to verify your account."
+        : "User registered successfully.",
       user: userResponse,
     });
   } catch (error) {
@@ -186,8 +414,76 @@ app.post("/auth/register", async (req, res) => {
   }
 });
 
-app.post("/auth/login", loginLimiter, async (req, res) => {
-  const { username, password } = req.body;
+// Email verification endpoint
+app.get("/auth/verify-email", async (req, res) => {
+  const { token } = req.query;
+
+  if (!token) {
+    return res.status(400).json({ message: "Verification token is required" });
+  }
+
+  try {
+    const user = await User.findOne({
+      emailVerificationToken: token,
+      emailVerificationExpires: { $gt: Date.now() },
+    });
+
+    if (!user) {
+      return res.status(400).json({
+        message: "Email verification token is invalid or has expired",
+      });
+    }
+
+    // Update user
+    user.emailVerified = true;
+    user.emailVerificationToken = undefined;
+    user.emailVerificationExpires = undefined;
+    await user.save();
+
+    // Redirect to frontend with success message
+    res.redirect(`${process.env.FRONTEND_URL}/login?verified=true`);
+  } catch (error) {
+    console.error("Email verification error:", error);
+    res.status(500).json({
+      message: "Error verifying email",
+      error:
+        process.env.NODE_ENV === "development" ? error.message : "Server error",
+    });
+  }
+});
+
+// Resend verification email
+app.post("/auth/resend-verification", authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (user.emailVerified) {
+      return res.status(400).json({ message: "Email is already verified" });
+    }
+
+    // Generate new verification token
+    user.emailVerificationToken = crypto.randomBytes(32).toString("hex");
+    user.emailVerificationExpires = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+    await user.save();
+
+    // Send verification email
+    const verificationUrl = `${process.env.FRONTEND_URL}/verify-email?token=${user.emailVerificationToken}`;
+    await sendVerificationEmail(user, verificationUrl);
+
+    res.status(200).json({ message: "Verification email sent successfully" });
+  } catch (error) {
+    console.error("Error resending verification email:", error);
+    res.status(500).json({ message: "Error sending verification email" });
+  }
+});
+
+// Login with MFA support
+app.post("/auth/login", async (req, res) => {
+  const { username, password, mfaToken } = req.body;
 
   if (!username || !password) {
     return res
@@ -216,6 +512,41 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
+    // Check if MFA is enabled
+    if (user.mfaEnabled) {
+      // If MFA token not provided, return partial auth
+      if (!mfaToken) {
+        return res.status(200).json({
+          message: "MFA required",
+          requiresMfa: true,
+          userId: user._id, // Only send minimal info
+        });
+      }
+
+      // Verify MFA token
+      const verified = speakeasy.totp.verify({
+        secret: user.mfaSecret,
+        encoding: "base32",
+        token: mfaToken,
+        window: 1, // Allow 1 period before/after for clock drift
+      });
+
+      if (!verified) {
+        // Check if it's a backup code
+        const backupCodeIndex = user.backupCodes?.findIndex(
+          (bc) => bc.code === mfaToken && !bc.used
+        );
+
+        if (backupCodeIndex === -1) {
+          return res.status(401).json({ message: "Invalid MFA code" });
+        }
+
+        // Mark backup code as used
+        user.backupCodes[backupCodeIndex].used = true;
+        await user.save();
+      }
+    }
+
     const { accessToken, refreshToken } = generateTokens(user);
 
     setAuthCookies(res, accessToken, refreshToken);
@@ -226,6 +557,8 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
       name: user.name,
       email: user.email,
       avatar: user.avatar,
+      emailVerified: user.emailVerified,
+      mfaEnabled: user.mfaEnabled,
     };
 
     res.status(200).json({
@@ -241,6 +574,278 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
     });
   }
 });
+
+// Forgot password - request reset
+app.post("/auth/forgot-password", passwordResetLimiter, async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ message: "Email is required" });
+  }
+
+  try {
+    // Find user by email
+    const user = await User.findOne({ email });
+
+    // Don't reveal if a user was found or not (security)
+    if (!user) {
+      return res.status(200).json({
+        message:
+          "If a user with that email exists, a password reset link has been sent.",
+      });
+    }
+
+    // Generate token
+    const resetToken = crypto.randomBytes(32).toString("hex");
+
+    // Save hashed token to user
+    user.resetPasswordToken = crypto
+      .createHash("sha256")
+      .update(resetToken)
+      .digest("hex");
+
+    user.resetPasswordExpires = Date.now() + 60 * 60 * 1000; // 1 hour
+    await user.save();
+
+    // Send email with reset link
+    const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
+    await sendPasswordResetEmail(user, resetUrl);
+
+    res.status(200).json({
+      message:
+        "If a user with that email exists, a password reset link has been sent.",
+    });
+  } catch (error) {
+    console.error("Password reset request error:", error);
+    res.status(500).json({
+      message: "Error processing password reset request",
+      error:
+        process.env.NODE_ENV === "development" ? error.message : "Server error",
+    });
+  }
+});
+
+// Reset password with token
+app.post("/auth/reset-password", async (req, res) => {
+  const { token, password } = req.body;
+
+  if (!token || !password) {
+    return res.status(400).json({ message: "Token and password are required" });
+  }
+
+  // Validate password
+  const passwordValidation = validatePassword(password);
+  if (!passwordValidation.valid) {
+    return res.status(400).json({
+      message: passwordValidation.message,
+      suggestions: passwordValidation.suggestions,
+      score: passwordValidation.score,
+    });
+  }
+
+  try {
+    // Hash the token to compare with stored hash
+    const hashedToken = crypto.createHash("sha256").update(token).digest("hex");
+
+    // Find user with valid token
+    const user = await User.findOne({
+      resetPasswordToken: hashedToken,
+      resetPasswordExpires: { $gt: Date.now() },
+    });
+
+    if (!user) {
+      return res.status(400).json({
+        message: "Password reset token is invalid or has expired",
+      });
+    }
+
+    // Update password and clear reset token
+    const salt = await bcrypt.genSalt(10);
+    user.password = await bcrypt.hash(password, salt);
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpires = undefined;
+    await user.save();
+
+    // Generate tokens for automatic login
+    const { accessToken, refreshToken } = generateTokens(user);
+    setAuthCookies(res, accessToken, refreshToken);
+
+    res.status(200).json({
+      message: "Password has been reset successfully",
+    });
+  } catch (error) {
+    console.error("Password reset error:", error);
+    res.status(500).json({
+      message: "Error resetting password",
+      error:
+        process.env.NODE_ENV === "development" ? error.message : "Server error",
+    });
+  }
+});
+
+// MFA Setup - Generate secret and QR code
+app.post("/auth/mfa/setup", authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Generate secret
+    const secret = speakeasy.generateSecret({
+      name: `${process.env.APP_NAME || "Auth System"}:${
+        user.email || user.username
+      }`,
+    });
+
+    // Save secret to user (temporarily until verified)
+    user.mfaSecret = secret.base32;
+    await user.save();
+
+    // Generate QR code
+    const qrCodeUrl = await qrcode.toDataURL(secret.otpauth_url);
+
+    res.status(200).json({
+      secret: secret.base32,
+      qrCode: qrCodeUrl,
+    });
+  } catch (error) {
+    console.error("MFA setup error:", error);
+    res.status(500).json({
+      message: "Error setting up MFA",
+      error:
+        process.env.NODE_ENV === "development" ? error.message : "Server error",
+    });
+  }
+});
+
+// MFA Setup - Verify and enable
+app.post("/auth/mfa/verify", authenticateToken, async (req, res) => {
+  const { token } = req.body;
+
+  if (!token) {
+    return res.status(400).json({ message: "Verification token is required" });
+  }
+
+  try {
+    const user = await User.findById(req.user.id);
+
+    if (!user || !user.mfaSecret) {
+      return res.status(400).json({ message: "MFA setup not initiated" });
+    }
+
+    // Verify token
+    const verified = speakeasy.totp.verify({
+      secret: user.mfaSecret,
+      encoding: "base32",
+      token,
+      window: 1,
+    });
+
+    if (!verified) {
+      return res.status(400).json({ message: "Invalid verification code" });
+    }
+
+    // Enable MFA
+    user.mfaEnabled = true;
+
+    // Generate backup codes
+    const backupCodes = [];
+    for (let i = 0; i < 10; i++) {
+      // Generate a readable 8-character backup code
+      const code = crypto.randomBytes(4).toString("hex").toUpperCase();
+      backupCodes.push({
+        code,
+        used: false,
+      });
+    }
+    user.backupCodes = backupCodes;
+
+    await user.save();
+
+    res.status(200).json({
+      message: "MFA enabled successfully",
+      backupCodes: backupCodes.map((bc) => bc.code),
+    });
+  } catch (error) {
+    console.error("MFA verification error:", error);
+    res.status(500).json({
+      message: "Error verifying MFA",
+      error:
+        process.env.NODE_ENV === "development" ? error.message : "Server error",
+    });
+  }
+});
+
+// Disable MFA
+app.post("/auth/mfa/disable", authenticateToken, async (req, res) => {
+  const { password, mfaToken } = req.body;
+
+  if (!password) {
+    return res.status(400).json({ message: "Password is required" });
+  }
+
+  try {
+    const user = await User.findById(req.user.id);
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (!user.mfaEnabled) {
+      return res.status(400).json({ message: "MFA is not enabled" });
+    }
+
+    // Verify password
+    const validPassword = await bcrypt.compare(password, user.password);
+    if (!validPassword) {
+      return res.status(401).json({ message: "Invalid password" });
+    }
+
+    // Verify MFA token if provided
+    if (user.mfaEnabled) {
+      if (!mfaToken) {
+        return res.status(400).json({ message: "MFA token is required" });
+      }
+
+      const verified = speakeasy.totp.verify({
+        secret: user.mfaSecret,
+        encoding: "base32",
+        token: mfaToken,
+        window: 1,
+      });
+
+      if (!verified) {
+        // Check if it's a backup code
+        const backupCodeIndex = user.backupCodes.findIndex(
+          (bc) => bc.code === mfaToken && !bc.used
+        );
+
+        if (backupCodeIndex === -1) {
+          return res.status(401).json({ message: "Invalid MFA code" });
+        }
+      }
+    }
+
+    // Disable MFA
+    user.mfaEnabled = false;
+    user.mfaSecret = undefined;
+    user.backupCodes = undefined;
+    await user.save();
+
+    res.status(200).json({ message: "MFA disabled successfully" });
+  } catch (error) {
+    console.error("MFA disable error:", error);
+    res.status(500).json({
+      message: "Error disabling MFA",
+      error:
+        process.env.NODE_ENV === "development" ? error.message : "Server error",
+    });
+  }
+});
+
+// Existing routes below remain largely unchanged
 
 app.post("/auth/refresh-token", async (req, res) => {
   const refreshToken = req.cookies.refresh_token;
@@ -277,7 +882,9 @@ app.post("/auth/refresh-token", async (req, res) => {
 
 app.get("/auth/me", authenticateToken, async (req, res) => {
   try {
-    const user = await User.findById(req.user.id).select("-password -__v");
+    const user = await User.findById(req.user.id).select(
+      "-password -__v -resetPasswordToken -resetPasswordExpires -mfaSecret -backupCodes"
+    );
 
     if (!user) {
       return res.status(404).json({ message: "User not found" });
@@ -370,6 +977,8 @@ app.get("/auth/google/callback", async (req, res) => {
         if (existingUser) {
           existingUser.googleId = googleUserInfo.id;
           existingUser.avatar = existingUser.avatar || googleUserInfo.picture;
+          // For OAuth users, mark email as verified
+          existingUser.emailVerified = true;
           user = await existingUser.save();
         }
       }
@@ -383,6 +992,8 @@ app.get("/auth/google/callback", async (req, res) => {
             ? googleUserInfo.email.split("@")[0]
             : `user_${googleUserInfo.id}`,
           avatar: googleUserInfo.picture,
+          // For OAuth users, mark email as verified
+          emailVerified: true,
         });
 
         await user.save();
@@ -400,6 +1011,7 @@ app.get("/auth/google/callback", async (req, res) => {
       email: user.email,
       avatar: user.avatar,
       googleId: user.googleId, // Include this so frontend knows the provider
+      emailVerified: user.emailVerified,
     };
 
     // Redirect with user data included
@@ -498,6 +1110,8 @@ app.get("/auth/github/callback", async (req, res) => {
           existingUser.githubId = githubUserInfo.id;
           existingUser.avatar =
             existingUser.avatar || githubUserInfo.avatar_url;
+          // For OAuth users, mark email as verified
+          existingUser.emailVerified = true;
           user = await existingUser.save();
         }
       }
@@ -511,6 +1125,8 @@ app.get("/auth/github/callback", async (req, res) => {
             githubUserInfo.login ||
             (email ? email.split("@")[0] : `user_${githubUserInfo.id}`),
           avatar: githubUserInfo.avatar_url,
+          // For OAuth users, mark email as verified
+          emailVerified: true,
         });
 
         await user.save();
@@ -528,6 +1144,7 @@ app.get("/auth/github/callback", async (req, res) => {
       email: user.email,
       avatar: user.avatar,
       githubId: user.githubId, // Include this so frontend knows the provider
+      emailVerified: user.emailVerified,
     };
 
     // Redirect with user data included
@@ -542,7 +1159,8 @@ app.get("/auth/github/callback", async (req, res) => {
   }
 });
 
-app.post("/jobs", authenticateToken, async (req, res) => {
+// Example of a protected route that requires verified email
+app.post("/jobs", authenticateToken, requireVerifiedEmail, async (req, res) => {
   const { title, location, description, salary, employmentType, isActive } =
     req.body;
   const userId = req.user.id;
@@ -647,6 +1265,7 @@ app.delete("/jobs/:id", authenticateToken, async (req, res) => {
   }
 });
 
+// Clean up expired OAuth states to prevent memory leaks
 setInterval(() => {
   const now = Date.now();
   for (const [state, data] of oauthStates.entries()) {
@@ -656,10 +1275,12 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// 404 handler
 app.use((req, res, next) => {
   res.status(404).json({ message: "Resource not found" });
 });
 
+// Global error handler
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   res.status(500).json({
